@@ -1068,8 +1068,8 @@ const store = (function () {
 })();
 
 /* ---- resultados COMPARTILHADOS (Supabase, tabela "resultados") ----
-   Cada participação encerrada vira uma linha: colunas planas (id, nome, total, pct, data) para consulta
-   no painel do Supabase e a participação completa em "registro" (jsonb), que é o que o jogo lê.
+   Cada participação encerrada vira uma linha: id, total (para ordenar e consultar no painel do Supabase),
+   atualizado_em e a participação completa em "dados" (jsonb), que é o que o jogo lê.
    Se o envio falhar (sem internet, por exemplo), o registro fica guardado neste navegador em "pendentes"
    e é reenviado automaticamente na próxima abertura ou quando a conexão voltar. */
 const REMOTO = {
@@ -1102,9 +1102,9 @@ async function remotoFetch(caminho, opts) {
     throw e;
   } finally { clearTimeout(t); }
 }
-function paraLinha(reg) { return { id: reg.id, nome: reg.nome, total: reg.total, pct: reg.pct, data: reg.data, registro: reg }; }
+function paraLinha(reg) { return { id: reg.id, total: reg.total, dados: reg, atualizado_em: new Date().toISOString() }; }
 function deLinha(row) {
-  const r = row && row.registro;
+  const r = row && row.dados;
   return r && typeof r === 'object' && typeof r.id === 'string' && typeof r.total === 'number' && Array.isArray(r.porFluxo) ? r : null;
 }
 function lerPendentes() {
@@ -1126,7 +1126,7 @@ function salvarRegistro(reg) {
 async function carregarResultados() {
   rede.carregando = true;
   try {
-    const r = await remotoFetch(REMOTO.tabela + '?select=registro&order=total.desc&limit=' + REMOTO.limite, { headers: remotoHeaders() });
+    const r = await remotoFetch(REMOTO.tabela + '?select=dados&order=total.desc&limit=' + REMOTO.limite, { headers: remotoHeaders() });
     const rows = await r.json();
     rede.regs = (Array.isArray(rows) ? rows : []).map(deLinha).filter(Boolean);
     rede.erro = ''; rede.carregado = true; rede.ultima = Date.now();
