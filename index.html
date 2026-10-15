@@ -1067,15 +1067,95 @@ const store = (function () {
   };
 })();
 
+/* ---- resultados COMPARTILHADOS (Supabase, tabela "resultados") ----
+   Cada participação encerrada vira uma linha: colunas planas (id, nome, total, pct, data) para consulta
+   no painel do Supabase e a participação completa em "registro" (jsonb), que é o que o jogo lê.
+   Se o envio falhar (sem internet, por exemplo), o registro fica guardado neste navegador em "pendentes"
+   e é reenviado automaticamente na próxima abertura ou quando a conexão voltar. */
+const REMOTO = {
+  base: 'https://fskkpyknefpvhcadmbni.supabase.co/rest/v1/',
+  key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZza2tweWtuZWZwdmhjYWRtYm5pIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwOTQxOTYsImV4cCI6MjEwNzY3MDE5Nn0.cSNQxCnWwhdh8uJgv_wZWG2xUwqU3aof2WrJ0f6dqJg',
+  tabela: 'resultados',
+  limite: 1000
+};
+const rede = { regs: [], carregado: false, carregando: false, erro: '', ultima: null, enviando: false, erroEnvio: '' };
+
+function msgErro(e) {
+  const m = String((e && e.message) || e || '');
+  if (/failed to fetch|networkerror|load failed|network request failed/i.test(m)) return 'sem conexão com o servidor';
+  return m || 'erro desconhecido';
+}
+function remotoHeaders(extra) {
+  return Object.assign({ apikey: REMOTO.key, Authorization: 'Bearer ' + REMOTO.key, 'Content-Type': 'application/json' }, extra || {});
+}
+async function remotoFetch(caminho, opts) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const r = await fetch(REMOTO.base + caminho, Object.assign({ signal: ctl.signal }, opts || {}));
+    if (!r.ok) {
+      let m = ''; try { const j = await r.json(); m = j.message || j.hint || j.details || ''; } catch (e) {}
+      throw new Error('HTTP ' + r.status + (m ? ' - ' + m : ''));
+    }
+    return r;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('tempo esgotado ao falar com o servidor');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+function paraLinha(reg) { return { id: reg.id, nome: reg.nome, total: reg.total, pct: reg.pct, data: reg.data, registro: reg }; }
+function deLinha(row) {
+  const r = row && row.registro;
+  return r && typeof r === 'object' && typeof r.id === 'string' && typeof r.total === 'number' && Array.isArray(r.porFluxo) ? r : null;
+}
+function lerPendentes() {
+  const p = store.ler('pendentes', []);
+  return Array.isArray(p) ? p.filter(x => x && typeof x.id === 'string' && typeof x.total === 'number') : [];
+}
+/* lista usada por toda a interface: o que está no servidor + o que ainda aguarda envio */
 function lerResultados() {
-  const r = store.ler('resultados', []);
-  return Array.isArray(r) ? r.filter(x => x && typeof x.id === 'string' && typeof x.total === 'number') : [];
+  const mapa = new Map();
+  rede.regs.forEach(r => mapa.set(r.id, r));
+  lerPendentes().forEach(r => mapa.set(r.id, r));
+  return Array.from(mapa.values());
 }
 function salvarRegistro(reg) {
-  const l = lerResultados(); const i = l.findIndex(x => x.id === reg.id);
-  if (i >= 0) l[i] = reg; else l.push(reg);
-  store.gravar('resultados', l);
-  return l;
+  const p = lerPendentes().filter(x => x.id !== reg.id); p.push(reg);
+  store.gravar('pendentes', p);
+  return lerResultados();
+}
+async function carregarResultados() {
+  rede.carregando = true;
+  try {
+    const r = await remotoFetch(REMOTO.tabela + '?select=registro&order=total.desc&limit=' + REMOTO.limite, { headers: remotoHeaders() });
+    const rows = await r.json();
+    rede.regs = (Array.isArray(rows) ? rows : []).map(deLinha).filter(Boolean);
+    rede.erro = ''; rede.carregado = true; rede.ultima = Date.now();
+  } catch (e) { rede.erro = msgErro(e); }
+  rede.carregando = false;
+  return !rede.erro;
+}
+async function sincronizar() {
+  const p = lerPendentes();
+  if (!p.length) { rede.erroEnvio = ''; return { ok: true, enviados: 0 }; }
+  if (rede.enviando) return { ok: false, ocupado: true };
+  rede.enviando = true; let erro = '';
+  try {
+    await remotoFetch(REMOTO.tabela + '?on_conflict=id', {
+      method: 'POST',
+      headers: remotoHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(p.map(paraLinha))
+    });
+    const enviados = new Set(p.map(x => x.id));
+    store.gravar('pendentes', lerPendentes().filter(x => !enviados.has(x.id)));
+  } catch (e) { erro = msgErro(e); }
+  rede.enviando = false; rede.erroEnvio = erro;
+  return { ok: !erro, erro: erro, enviados: erro ? 0 : p.length };
+}
+/* apaga TODAS as linhas do servidor; devolve quantas foram apagadas (0 se faltar a política de DELETE) */
+async function apagarResultadosRemotos() {
+  const r = await remotoFetch(REMOTO.tabela + '?id=not.is.null&select=id', { method: 'DELETE', headers: remotoHeaders({ Prefer: 'return=representation' }) });
+  const linhas = await r.json();
+  return Array.isArray(linhas) ? linhas.length : 0;
 }
 function lerSessao() {
   const s = store.ler('sessao', null);
@@ -1203,6 +1283,38 @@ function bar(pct, rotulo, cls) {
   return '<div class="bar ' + (cls || '') + '" role="progressbar" aria-label="' + esc(rotulo) + '" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + Math.round(p) + '"><i style="width:' + p + '%"></i></div>';
 }
 function salvar() { gravarSessao(sess); }
+
+/* ---------- rede: ranking compartilhado ---------- */
+/* re-renderiza sem atrapalhar quem está digitando ou com janela aberta */
+function renderSeguro() {
+  if (ui.modal) return;
+  if (['start', 'final', 'ranking', 'admin'].indexOf(ui.view) < 0) return;
+  const a = document.activeElement;
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT')) return;
+  render();
+}
+async function atualizarRede(reenviar) {
+  if (reenviar && lerPendentes().length) await sincronizar();
+  await carregarResultados();
+  renderSeguro();
+}
+async function enviarEAtualizar() {
+  await sincronizar();
+  renderSeguro();
+  await carregarResultados();
+  renderSeguro();
+}
+function statusRede() {
+  if (rede.erro) return '<p class="alert warn">' + ic.info + '<span>Não foi possível atualizar a classificação (' + esc(rede.erro) + '). ' + (lerResultados().length ? 'Mostrando os dados já carregados. ' : '') + '<button class="link" data-act="recarregar">Tentar novamente</button></span></p>';
+  if (rede.carregando && !rede.carregado) return '<p class="alert info">' + ic.info + '<span>Carregando a classificação…</span></p>';
+  return '';
+}
+function statusEnvio(reg) {
+  const pend = lerPendentes().some(p => p.id === reg.id);
+  if (rede.enviando) return '<p class="alert info">' + ic.info + '<span>Enviando seu resultado ao ranking compartilhado…</span></p>';
+  if (pend) return '<p class="alert warn">' + ic.info + '<span>Seu resultado ainda não chegou ao ranking compartilhado (' + esc(rede.erroEnvio || 'aguardando envio') + '). Ele está salvo neste navegador e será reenviado. <button class="link" data-act="reenviar">Tentar enviar agora</button></span></p>';
+  return '';
+}
 function aviso(msg) { ui.toast = msg; renderToast(); clearTimeout(aviso._t); aviso._t = setTimeout(() => { ui.toast = ''; renderToast(); }, 3200); }
 function renderToast() {
   let t = document.getElementById('toast');
@@ -1220,10 +1332,10 @@ function topbarAdmin() {
   return '<header class="topbar adm"><div class="wrap topbar-in"><button class="brand" data-act="home" aria-label="Sair da área administrativa">' + brandMark + '<span>DESAFIO DOS FLUXOS</span></button><span class="adm-tag">' + ic.lock + 'Área administrativa</span><div class="top-right">' + (ui.adminOk ? '<button class="btn sm ghost-d" data-act="admin-sair">Bloquear</button>' : '') + '<button class="btn sm ghost-d" data-act="home">Voltar ao jogo</button></div></div></header>';
 }
 function rodape() {
-  return '<footer class="wrap foot"><span>Ranking e resultados ficam salvos neste navegador e dispositivo.</span><span><button class="link" data-act="ranking">Classificação geral</button> · <button class="link" data-act="admin">Área administrativa</button></span></footer>';
+  return '<footer class="wrap foot"><span>O ranking é compartilhado: todos os colaboradores veem a mesma classificação.</span><span><button class="link" data-act="ranking">Classificação geral</button> · <button class="link" data-act="admin">Área administrativa</button></span></footer>';
 }
 function avisoStorage() {
-  return store.persiste ? '' : '<div class="wrap"><p class="alert warn">' + ic.info + '<span>Este navegador bloqueou o armazenamento local. O jogo funciona, mas os resultados e o ranking <b>não serão mantidos</b> após fechar ou atualizar a página.</span></p></div>';
+  return store.persiste ? '' : '<div class="wrap"><p class="alert warn">' + ic.info + '<span>Este navegador bloqueou o armazenamento local. O jogo funciona, mas o seu progresso <b>não será mantido</b> após fechar ou atualizar a página. O resultado final continua sendo enviado ao ranking compartilhado.</span></p></div>';
 }
 
 /* ---------- 1. tela inicial ---------- */
@@ -1241,7 +1353,7 @@ function viewStart() {
     + regra('1', 'Uma etapa por vez', 'Escolha qual é a próxima etapa do procedimento. Os fluxos são organizados por CRM: Adapter, NG e Simetra' + (CONFIG.INCLUIR_GERAL ? ', mais os procedimentos gerais, sem CRM.' : '.'))
     + regra('3', 'Três tentativas por etapa', 'Cada resposta incorreta usa uma tentativa. Ao esgotar as três, a etapa correta é mostrada e você continua o fluxo. Atualizar a página não devolve tentativas.')
     + regra('pts', 'Pontuação', '<span class="pts-row"><b>100</b> 1ª tentativa</span><span class="pts-row"><b>70</b> 2ª tentativa</span><span class="pts-row"><b>40</b> 3ª tentativa</span><span class="pts-row"><b>0</b> sem acerto</span>')
-    + regra('rk', 'Ranking', 'Seu desempenho é registrado no ranking deste dispositivo e navegador' + (regs.length ? ' (' + regs.length + ' participaç' + (regs.length === 1 ? 'ão' : 'ões') + ' até agora).' : '.'))
+    + regra('rk', 'Ranking', 'Seu desempenho é registrado no ranking compartilhado, visto por todos' + (regs.length ? ' (' + regs.length + ' participaç' + (regs.length === 1 ? 'ão' : 'ões') + ' até agora).' : '.'))
     + '</section></main>' + rodape();
 }
 function regra(k, tit, txt) {
@@ -1382,7 +1494,7 @@ function viewFinal() {
     + '<div class="kpi"><span class="k-l">Fluxos concluídos</span><span class="k-v">' + reg.fluxos + '</span><span class="k-s">de ' + reg.totalFluxos + ' disponíveis</span></div>'
     + '<div class="kpi rank"><span class="k-l">Posição no ranking</span><span class="k-v">' + (pos ? pos.pos + 'º' : '—') + '</span><span class="k-s">' + (pos ? 'de ' + pos.de + ' participaç' + (pos.de === 1 ? 'ão' : 'ões') : '') + '</span></div></div>'
     + '<p class="msg">' + mensagemFinal(reg.pct) + '</p>'
-    + (reg.fluxos < reg.totalFluxos ? '<p class="alert info">' + ic.info + '<span>Você encerrou com ' + reg.fluxos + ' de ' + reg.totalFluxos + ' fluxos. O aproveitamento considera apenas os fluxos concluídos.</span></p>' : '') + '</section>'
+    + (reg.fluxos < reg.totalFluxos ? '<p class="alert info">' + ic.info + '<span>Você encerrou com ' + reg.fluxos + ' de ' + reg.totalFluxos + ' fluxos. O aproveitamento considera apenas os fluxos concluídos.</span></p>' : '') + '</section>' + statusEnvio(reg)
     + '<section class="panel"><h3>Desempenho por CRM</h3><div class="tw"><table class="tbl"><thead><tr><th>CRM</th><th class="num">Fluxos</th><th class="num">Pontos</th><th></th><th class="num">Aprov.</th></tr></thead><tbody>' + crmRows + '</tbody></table></div></section>'
     + '<section class="panel"><h3>Distribuição dos acertos</h3><p class="muted">' + reg.decisoes + ' decisões respondidas · ' + reg.tentativas + ' tentativas utilizadas</p><div class="dist">' + dist + '</div></section>'
     + '<section class="panel"><h3>Desempenho por fluxo</h3><div class="tw"><table class="tbl"><thead><tr><th>CRM</th><th>Fluxo</th><th class="num">Pontos</th><th class="num">Aprov.</th><th class="num" title="1ª · 2ª · 3ª tentativa · sem acerto">1ª · 2ª · 3ª · ✗</th></tr></thead><tbody>' + fluxRows + '</tbody></table></div></section>'
@@ -1394,8 +1506,8 @@ function viewRanking() {
   const lista = ordenarRanking(lerResultados());
   const meu = sess && sess.registroId;
   const linhas = lista.map(e => '<tr class="' + (meu && e.reg.id === meu ? 'me' : '') + '"><td class="pos">' + (e.pos <= 3 ? '<span class="medal m' + e.pos + '">' + e.pos + '</span>' : e.pos + 'º') + '</td><td>' + esc(e.reg.nome) + (meu && e.reg.id === meu ? ' <span class="voce">você</span>' : '') + '</td><td class="num"><b>' + e.reg.total + '</b></td><td class="num">' + fmtPct(e.reg.pct) + '</td><td class="num">' + e.reg.fluxos + '</td><td class="num dt">' + fmtData(e.reg.data) + '</td></tr>').join('');
-  return topbar() + '<main class="wrap rank"><div class="rank-h"><div><p class="eyebrow">Classificação geral</p><h2>Ranking deste dispositivo</h2><p class="muted">Ordenado pela maior pontuação. Empates: maior aproveitamento e, depois, menos tentativas incorretas.</p></div><button class="btn ghost" data-act="sair-rank">' + ic.back + 'Voltar</button></div>'
-    + (lista.length ? '<div class="tw panel"><table class="tbl rk"><thead><tr><th>Pos.</th><th>Colaborador</th><th class="num">Pontuação</th><th class="num">Aprov.</th><th class="num">Fluxos</th><th class="num">Data e horário</th></tr></thead><tbody>' + linhas + '</tbody></table></div>' : '<div class="empty panel">' + ic.trophy + '<h3>Nenhuma participação concluída ainda</h3><p>O ranking é atualizado automaticamente quando alguém encerra uma participação neste navegador.</p></div>')
+  return topbar() + '<main class="wrap rank"><div class="rank-h"><div><p class="eyebrow">Classificação geral</p><h2>Ranking compartilhado</h2><p class="muted">Ordenado pela maior pontuação. Empates: maior aproveitamento e, depois, menos tentativas incorretas.</p></div><div class="row-act"><button class="btn ghost" data-act="recarregar">' + (rede.carregando ? 'Atualizando…' : 'Atualizar') + '</button><button class="btn ghost" data-act="sair-rank">' + ic.back + 'Voltar</button></div></div>' + statusRede()
+    + (lista.length ? '<div class="tw panel"><table class="tbl rk"><thead><tr><th>Pos.</th><th>Colaborador</th><th class="num">Pontuação</th><th class="num">Aprov.</th><th class="num">Fluxos</th><th class="num">Data e horário</th></tr></thead><tbody>' + linhas + '</tbody></table></div>' : '<div class="empty panel">' + ic.trophy + '<h3>Nenhuma participação concluída ainda</h3><p>O ranking é atualizado automaticamente quando alguém encerra uma participação.</p></div>')
     + '</main>' + rodape();
 }
 
@@ -1419,7 +1531,7 @@ function viewAdmin() {
   else if (ui.adminTab === 'consolidado') corpo = admConsolidado(regs);
   else if (ui.adminTab === 'fluxos') corpo = admFluxos();
   else corpo = admDados(regs);
-  return topbarAdmin() + '<main class="wrap adm"><div class="adm-h"><h2>Painel de resultados</h2><span class="muted">' + regs.length + ' participaç' + (regs.length === 1 ? 'ão' : 'ões') + ' registrada' + (regs.length === 1 ? '' : 's') + ' neste dispositivo</span></div><div class="tabs2" role="tablist">' + tabs + '</div>' + corpo + '</main>';
+  return topbarAdmin() + '<main class="wrap adm"><div class="adm-h"><h2>Painel de resultados</h2><span class="muted">' + regs.length + ' participaç' + (regs.length === 1 ? 'ão' : 'ões') + ' registrada' + (regs.length === 1 ? '' : 's') + ' no ranking compartilhado · <button class="link" data-act="recarregar">' + (rede.carregando ? 'Atualizando…' : 'Atualizar') + '</button></span></div><div class="tabs2" role="tablist">' + tabs + '</div>' + corpo + '</main>';
 }
 function admFiltrar(regs) {
   const a = ui.adm; const q = norm(a.busca);
@@ -1481,8 +1593,8 @@ function admFluxos() {
 }
 function admDados(regs) {
   return '<section class="panel"><h3>Exportação</h3><p class="muted">CSV com separador ponto e vírgula e codificação UTF-8, compatível com Excel. O resumo traz uma linha por participação; o detalhe traz uma linha por fluxo, com os pontos de cada decisão.</p><div class="row-act"><button class="btn primary" data-act="csv-resumo">Exportar resumo (CSV)</button><button class="btn ghost" data-act="csv-detalhe">Exportar por fluxo (CSV)</button></div></section>'
-    + '<section class="panel"><h3>Armazenamento</h3><p>' + (store.persiste ? 'Os dados ficam no armazenamento local deste navegador (' + regs.length + ' registro' + (regs.length === 1 ? '' : 's') + '). Não há sincronização entre computadores ou navegadores diferentes.' : '<b>O armazenamento local está indisponível:</b> os dados ficam apenas em memória e se perdem ao fechar a página.') + '</p><p class="muted">Os registros usam uma estrutura plana (participação e fluxos), pronta para migrar depois para uma planilha online ou banco de dados compartilhado.</p></section>'
-    + '<section class="panel danger-z"><h3>Limpar ranking</h3><p>Apaga todos os resultados salvos neste navegador. Exporte o CSV antes, se precisar guardar os dados.</p><button class="btn danger" data-act="limpar" ' + (regs.length ? '' : 'disabled') + '>Limpar todos os resultados</button></section>'
+    + '<section class="panel"><h3>Armazenamento</h3><p>Os resultados ficam no Supabase (tabela <code>resultados</code>) e são compartilhados por todos os colaboradores: ' + regs.length + ' registro' + (regs.length === 1 ? '' : 's') + ' no ranking' + (rede.erro ? '. <b>Falha na última atualização:</b> ' + esc(rede.erro) : '') + (lerPendentes().length ? '. <b>' + lerPendentes().length + ' aguardando envio</b> neste navegador' : '') + '.</p><p class="muted">O progresso de cada participação em andamento fica apenas no navegador de quem está jogando. Resultados ainda não enviados ficam guardados aqui até o envio dar certo.</p><div class="row-act"><button class="btn ghost" data-act="recarregar">Atualizar agora</button>' + (lerPendentes().length ? '<button class="btn primary" data-act="reenviar">Reenviar pendentes</button>' : '') + '</div></section>'
+    + '<section class="panel danger-z"><h3>Limpar ranking</h3><p>Apaga todos os resultados do ranking compartilhado, para todos os colaboradores. Exporte o CSV antes, se precisar guardar os dados. Requer uma política de DELETE para o papel <code>anon</code> no Supabase; sem ela nada é apagado.</p><button class="btn danger" data-act="limpar" ' + (regs.length ? '' : 'disabled') + '>Limpar todos os resultados</button></section>'
     + '<section class="panel"><h3>PIN administrativo</h3><button class="btn ghost" data-act="trocar-pin">Alterar PIN</button><p class="alert warn">' + ic.info + '<span><b>Limite de segurança:</b> proteção local apenas. Não substitui controle de acesso de verdade; quem usa o mesmo navegador pode limpar os dados do site e redefinir o PIN.</span></p></section>';
 }
 
@@ -1499,7 +1611,7 @@ function viewModal() {
   } else if (m.tipo === 'descartar') {
     corpo = '<h3 id="m-t">Descartar participação?</h3><p>O progresso e os pontos desta participação serão perdidos e nada será registrado no ranking.</p><div class="m-act"><button class="btn ghost" data-act="fechar">Cancelar</button><button class="btn danger" data-act="descartar-ok">Descartar</button></div>';
   } else if (m.tipo === 'limpar') {
-    corpo = '<h3 id="m-t">Limpar todos os resultados?</h3><p>Esta ação apaga ' + lerResultados().length + ' registro(s) do ranking e não pode ser desfeita. Digite <b>LIMPAR</b> para confirmar.</p><input id="m-conf" type="text" autocomplete="off" aria-label="Digite LIMPAR"><div class="m-act"><button class="btn ghost" data-act="fechar">Cancelar</button><button class="btn danger" data-act="limpar-ok" id="m-ok" disabled>Apagar tudo</button></div>';
+    corpo = '<h3 id="m-t">Limpar todos os resultados?</h3><p>Esta ação apaga ' + lerResultados().length + ' registro(s) do ranking compartilhado, de todos os colaboradores, e não pode ser desfeita. Digite <b>LIMPAR</b> para confirmar.</p><input id="m-conf" type="text" autocomplete="off" aria-label="Digite LIMPAR"><div class="m-act"><button class="btn ghost" data-act="fechar">Cancelar</button><button class="btn danger" data-act="limpar-ok" id="m-ok" disabled>Apagar tudo</button></div>';
   } else if (m.tipo === 'pin') {
     corpo = '<h3 id="m-t">Alterar PIN</h3><form id="f-pin2" novalidate><label for="pin-a">PIN atual</label><input id="pin-a" type="password" autocomplete="off" maxlength="12"><label for="pin-n">Novo PIN (4 a 12 caracteres)</label><input id="pin-n" type="password" autocomplete="off" maxlength="12"><p class="erro" role="alert">' + esc(m.erro || '') + '</p><div class="m-act"><button class="btn ghost" type="button" data-act="fechar">Cancelar</button><button class="btn primary" type="submit">Salvar PIN</button></div></form>';
   } else if (m.tipo === 'csv') {
@@ -1587,12 +1699,14 @@ document.addEventListener('click', async ev => {
     case 'pausar': ui.modal = { tipo: 'pausar' }; render(); break;
     case 'fluxos': ui.modal = null; ui.crmTab = sess.atual && FLOW_BY_ID[sess.atual] ? FLOW_BY_ID[sess.atual].crm : ui.crmTab; ir('select'); break;
     case 'encerrar': ui.modal = { tipo: 'encerrar' }; render(); break;
-    case 'final': if (finalizar()) { ui.modal = null; ir('final'); } break;
+    case 'final': if (finalizar()) { ui.modal = null; enviarEAtualizar(); ir('final'); } break;
+    case 'recarregar': atualizarRede(true); render(); break;
+    case 'reenviar': enviarEAtualizar(); render(); break;
     case 'fechar': ui.modal = null; render(); break;
     case 'nova': sess = null; gravarSessao(null); ui.regFinal = null; ui.nomeDigitado = ''; ir('start'); break;
-    case 'ranking': ui.voltarPara = ui.view; ir('ranking'); break;
+    case 'ranking': ui.voltarPara = ui.view; atualizarRede(true); ir('ranking'); break;
     case 'sair-rank': ir(sess ? (sess.registroId ? 'final' : 'select') : 'start'); break;
-    case 'admin': ui.pinErro = ''; ir('admin'); break;
+    case 'admin': ui.pinErro = ''; atualizarRede(true); ir('admin'); break;
     case 'admin-sair': ui.adminOk = false; ui.pinErro = ''; render(); break;
     case 'atab': ui.adminTab = el.dataset.v; render(); break;
     case 'ordenar': { const a = ui.adm; const k = el.dataset.v; if (a.ordem === k) a.dir = a.dir === 'asc' ? 'desc' : 'asc'; else { a.ordem = k; a.dir = k === 'nome' ? 'asc' : 'desc'; } render(); break; }
@@ -1602,7 +1716,19 @@ document.addEventListener('click', async ev => {
     case 'csv-copiar': { const ta = document.getElementById('m-csv'); const txt = ui.modal && ui.modal.csv; try { await navigator.clipboard.writeText(txt); aviso('CSV copiado.'); } catch (e) { if (ta) { ta.focus(); ta.select(); } aviso('Selecione o texto e copie (Ctrl+C).'); } break; }
     case 'csv-baixar': if (ui.modal) baixarCsv(ui.modal.nome, ui.modal.csv); break;
     case 'limpar': ui.modal = { tipo: 'limpar' }; render(); break;
-    case 'limpar-ok': { const v = document.getElementById('m-conf'); if (v && v.value.trim().toUpperCase() === 'LIMPAR') { store.apagar('resultados'); ui.modal = null; ui.regFinal = null; render(); aviso('Resultados apagados.'); } break; }
+    case 'limpar-ok': {
+      const v = document.getElementById('m-conf');
+      if (v && v.value.trim().toUpperCase() === 'LIMPAR') {
+        const antes = rede.regs.length; ui.modal = null; render(); aviso('Apagando resultados…');
+        try {
+          const n = await apagarResultadosRemotos();
+          if (antes > 0 && n === 0) aviso('Nada foi apagado: falta a política de DELETE para anon no Supabase.');
+          else { store.apagar('pendentes'); ui.regFinal = null; aviso(n + ' resultado(s) apagado(s).'); }
+        } catch (e) { aviso('Não foi possível apagar: ' + msgErro(e)); }
+        await carregarResultados(); renderSeguro();
+      }
+      break;
+    }
     case 'trocar-pin': ui.modal = { tipo: 'pin' }; render(); break;
   }
 });
@@ -1646,6 +1772,11 @@ document.addEventListener('submit', async ev => {
 });
 
 render();
+
+/* ranking compartilhado: carrega ao abrir, reenvia pendentes, atualiza ao voltar a conexão e a cada 30 s na tela de classificação */
+atualizarRede(true);
+window.addEventListener('online', () => atualizarRede(true));
+setInterval(() => { if (ui.view === 'ranking' && !document.hidden && !rede.carregando) atualizarRede(false); }, 30000);
 
 </script>
 
